@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 server = Server("puch_ai")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "letmein")
 MOCK_USERS = {
-    "abc123token": "1234567890" # da we should add our actuall numbers here for validation
+    "abc123token": "1234567890" # real phone number was used to validate for Puch.ai hackathon
 }
 
 # Gemini configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+GEMINI_API_KEY =" Add your gemini API key here"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 if GEMINI_API_KEY:
     try:
