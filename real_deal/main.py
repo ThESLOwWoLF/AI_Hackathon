@@ -3,15 +3,95 @@ import json
 import logging
 from typing import Any, Dict
 import google.generativeai as genai
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, WebSocket, Request, HTTPException, Depends
 from fastapi.responses import JSONResponse, Response
 from mcp.server import Server, NotificationOptions, InitializationOptions
 from mcp.types import Tool, CallToolResult, TextContent
+from datetime import datetime, timedelta
+from collections import defaultdict
+import threading
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-server = Server("puch_ai")
+# Rate limiting storage
+class RateLimiter:
+    def __init__(self, max_requests: int = 50, window_hours: int = 24):
+        self.max_requests = max_requests
+        self.window_hours = window_hours
+        self.requests = defaultdict(list)
+        self.lock = threading.Lock()
+    
+    def is_allowed(self, ip: str) -> bool:
+        try:
+            now = datetime.now()
+            cutoff = now - timedelta(hours=self.window_hours)
+            
+            with self.lock:
+                # Clean old requests
+                self.requests[ip] = [req_time for req_time in self.requests[ip] if req_time > cutoff]
+                
+                # Check if under limit
+                if len(self.requests[ip]) < self.max_requests:
+                    self.requests[ip].append(now)
+                    return True
+                
+                return False
+        except Exception as e:
+            logger.error(f"Rate limit error for IP {ip}: {e}")
+            return True
+    
+    def get_remaining_requests(self, ip: str) -> int:
+        try:
+            now = datetime.now()
+            cutoff = now - timedelta(hours=self.window_hours)
+            
+            with self.lock:
+                # Clean old requests
+                self.requests[ip] = [req_time for req_time in self.requests[ip] if req_time > cutoff]
+                
+                return max(0, self.max_requests - len(self.requests[ip]))
+        except Exception as e:
+            logger.error(f"Error getting remaining requests for IP {ip}: {e}")
+            return self.max_requests
+
+# Initialize rate limiter
+rate_limiter = RateLimiter(max_requests=50, window_hours=24)
+
+# Rate limiting dependency
+async def check_rate_limit(request: Request):
+    """Dependency to check rate limits for each request"""
+    client_ip = request.client.host
+    
+    # Handle cases where client IP might be None (e.g., from proxy)
+    if not client_ip:
+        client_ip = "unknown"
+    
+    # Check rate limit
+    if not rate_limiter.is_allowed(client_ip):
+        remaining_time = rate_limiter.window_hours
+        raise HTTPException(
+            status_code=429, 
+            detail={
+                "error": "Rate limit exceeded",
+                "message": f"Maximum {rate_limiter.max_requests} requests per {rate_limiter.window_hours} hours exceeded",
+                "limit_reset": f"Resets in {remaining_time} hours",
+                "ip": client_ip
+            }
+        )
+    
+    # Return client IP for use in the endpoint
+    return client_ip
+
+def add_rate_limit_headers(response: Response, client_ip: str):
+    """Add rate limit headers to response"""
+    remaining = rate_limiter.get_remaining_requests(client_ip)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    response.headers["X-RateLimit-Limit"] = str(rate_limiter.max_requests)
+    response.headers["X-RateLimit-Reset"] = str(rate_limiter.window_hours)
+    return response
+
+server = Server("Travel_AI")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "letmein")
 MOCK_USERS = {
     "abc123token": "1234567890" # real phone number was used to validate for Puch.ai hackathon
@@ -28,10 +108,9 @@ if GEMINI_API_KEY:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    logger.info("Tools requested")
     return [Tool(
         name="validate",
-        description="Validate bearer token and return user's phone number for Puch AI authentication",
+        description="Validate bearer token and return user's phone number for Travel AI authentication",
         inputSchema={
             "type": "object",
             "properties": {"bearer_token": {"type": "string", "description": "Bearer token for authentication"}},
@@ -55,7 +134,6 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
-    logger.info(f"Tool called: {name} with arguments: {arguments}")
     if name == "validate":
         bearer_token = arguments.get("bearer_token", "")
         if bearer_token in MOCK_USERS:
@@ -75,7 +153,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
                 content=[TextContent(
                     type="text",
                     text=(
-                        "Gemini API key not configured. Set 'GEMINI_API_KEY' (or 'GOOGLE_API_KEY') in the environment "
+                        "Gemini API key not configured. Set 'GEMINI_API_KEY' in the environment "
                         "to enable the AI Trip Planner."
                     ),
                 )],
@@ -170,12 +248,25 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
     
     return CallToolResult(content=[TextContent(type="text", text=f"Tool not found: {name}")], isError=True)
 
-app = FastAPI()
+app = FastAPI(title="Travel AI MCP Server", version="1.0.0")
 
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    logger.info(f"Travel AI MCP Server started with rate limiting: {rate_limiter.max_requests} requests per {rate_limiter.window_hours} hours per IP")
+
+# Root endpoint
+@app.get("/")
 @app.post("/")
+async def read_root(client_ip: str = Depends(check_rate_limit)):
+    response_data = {"message": "Travel AI MCP Server | Built by Sudhan and Rochit"}
+    response = JSONResponse(content=response_data)
+    add_rate_limit_headers(response, client_ip)
+    return response
+
+# MCP HTTP endpoint
 @app.post("/mcp")
-async def mcp_http_endpoint(request: Request):
-    logger.info(f"HTTP POST with headers: {dict(request.headers)}")
+async def mcp_http_endpoint(request: Request, client_ip: str = Depends(check_rate_limit)):
     body = await request.body()
     try:
         data = json.loads(body.decode())
@@ -184,34 +275,41 @@ async def mcp_http_endpoint(request: Request):
         request_id = data.get("id")
 
         if method == "initialize":
-            return JSONResponse({
+            response = JSONResponse({
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "puch_ai", "version": "0.0.1"}
+                    "serverInfo": {"name": "Travel_AI", "version": "1.0.0"}
                 }
             })
+            add_rate_limit_headers(response, client_ip)
+            return response
         elif method == "notifications/initialized":
-            return Response(status_code=200)
+            response = Response(status_code=200)
+            add_rate_limit_headers(response, client_ip)
+            return response
         elif method == "tools/list":
             tools = await list_tools()
-            return JSONResponse({
+            response = JSONResponse({
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
                     "tools": [{"name": t.name, "description": t.description, "inputSchema": t.inputSchema} for t in tools]
                 }
             })
+            add_rate_limit_headers(response, client_ip)
+            return response
         elif method == "tools/call":
             name = params.get("name")
             arguments = params.get("arguments", {})
             auth_header = request.headers.get("authorization", "")
             if auth_header.startswith("Bearer "):
                 arguments["bearer_token"] = auth_header[7:]
+            
             result = await call_tool(name, arguments)
-            return JSONResponse({
+            response = JSONResponse({
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
@@ -219,22 +317,42 @@ async def mcp_http_endpoint(request: Request):
                     "isError": getattr(result, 'isError', False)
                 }
             })
-        return JSONResponse({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}, status_code=400)
+            add_rate_limit_headers(response, client_ip)
+            return response
+        
+        response = JSONResponse({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}, status_code=400)
+        add_rate_limit_headers(response, client_ip)
+        return response
     except Exception as e:
-        return JSONResponse({"jsonrpc": "2.0", "id": data.get("id") if 'data' in locals() else None, "error": {"code": -32603, "message": str(e)}}, status_code=500)
+        response = JSONResponse({"jsonrpc": "2.0", "id": data.get("id") if 'data' in locals() else None, "error": {"code": -32603, "message": str(e)}}, status_code=500)
+        add_rate_limit_headers(response, client_ip)
+        return response
 
+# WebSocket endpoint
 @app.websocket("/mcp")
 async def mcp_websocket_endpoint(websocket: WebSocket):
     try:
+        # Get client IP from WebSocket
+        client_ip = websocket.client.host
+        if not client_ip:
+            client_ip = "unknown"
+        
+        # Check rate limit before accepting connection
+        if not rate_limiter.is_allowed(client_ip):
+            await websocket.close(code=1008, reason="Rate limit exceeded")
+            return
+        
         await websocket.accept()
+        
         await server.run(websocket.receive_text, websocket.send_text, InitializationOptions(
-            server_name="puch_ai",
-            server_version="0.0.1",
+            server_name="Travel_ai",
+            server_version="1.0.0",
             capabilities=server.get_capabilities(notification_options=NotificationOptions())
         ))
     except Exception as e:
+        logger.error(f"WebSocket error: {e}")
         await websocket.close()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="debug")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
