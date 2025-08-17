@@ -3,22 +3,126 @@ import json
 import logging
 from typing import Any, Dict
 import google.generativeai as genai
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, WebSocket, Request, HTTPException
 from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.base import BaseHTTPMiddleware
 from mcp.server import Server, NotificationOptions, InitializationOptions
 from mcp.types import Tool, CallToolResult, TextContent
+from datetime import datetime, timedelta
+from collections import defaultdict
+import threading
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# Rate limiting storage
+class RateLimiter:
+    def __init__(self, max_requests: int = 50, window_hours: int = 24):
+        self.max_requests = max_requests
+        self.window_hours = window_hours
+        self.requests = defaultdict(list)
+        self.lock = threading.Lock()
+    
+    def is_allowed(self, ip: str) -> bool:
+        now = datetime.now()
+        cutoff = now - timedelta(hours=self.window_hours)
+        
+        with self.lock:
+            # Clean old requests
+            self.requests[ip] = [req_time for req_time in self.requests[ip] if req_time > cutoff]
+            
+            # Check if under limit
+            if len(self.requests[ip]) < self.max_requests:
+                self.requests[ip].append(now)
+                logger.info(f"Rate limit check passed for IP {ip}. Requests: {len(self.requests[ip])}/{self.max_requests}")
+                return True
+            
+            logger.warning(f"Rate limit exceeded for IP {ip}. Requests: {len(self.requests[ip])}/{self.max_requests}")
+            return False
+    
+    def get_remaining_requests(self, ip: str) -> int:
+        now = datetime.now()
+        cutoff = now - timedelta(hours=self.window_hours)
+        
+        with self.lock:
+            # Clean old requests
+            self.requests[ip] = [req_time for req_time in self.requests[ip] if req_time > cutoff]
+            
+            return max(0, self.max_requests - len(self.requests[ip]))
+    
+    def cleanup_old_entries(self):
+        """Clean up old IP entries that haven't been used recently"""
+        now = datetime.now()
+        cutoff = now - timedelta(hours=self.window_hours)
+        
+        with self.lock:
+            old_ips = [ip for ip, req_times in self.requests.items() 
+                      if not any(req_time > cutoff for req_time in req_times)]
+            
+            for ip in old_ips:
+                del self.requests[ip]
+            
+            if old_ips:
+                logger.info(f"Cleaned up {len(old_ips)} old IP entries")
+    
+    def get_stats(self):
+        """Get current rate limiting statistics"""
+        with self.lock:
+            total_ips = len(self.requests)
+            total_requests = sum(len(req_times) for req_times in self.requests.values())
+            return {
+                "total_ips": total_ips,
+                "total_requests": total_requests,
+                "max_requests_per_ip": self.max_requests,
+                "window_hours": self.window_hours
+            }
+
+# Initialize rate limiter
+rate_limiter = RateLimiter(max_requests=50, window_hours=24)
+
+# Rate limiting middleware
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Get client IP
+        client_ip = request.client.host
+        
+        # Handle cases where client IP might be None (e.g., from proxy)
+        if not client_ip:
+            client_ip = "unknown"
+            logger.warning("Could not determine client IP, using 'unknown'")
+        
+        # Check rate limit
+        if not rate_limiter.is_allowed(client_ip):
+            remaining_time = rate_limiter.window_hours
+            logger.warning(f"Rate limit exceeded for IP {client_ip} - returning 429 error")
+            raise HTTPException(
+                status_code=429, 
+                detail={
+                    "error": "Rate limit exceeded",
+                    "message": f"Maximum {rate_limiter.max_requests} requests per {rate_limiter.window_hours} hours exceeded",
+                    "limit_reset": f"Resets in {remaining_time} hours",
+                    "ip": client_ip
+                }
+            )
+        
+        # Add rate limit headers to response
+        response = await call_next(request)
+        remaining = rate_limiter.get_remaining_requests(client_ip)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+        response.headers["X-RateLimit-Limit"] = str(rate_limiter.max_requests)
+        response.headers["X-RateLimit-Reset"] = str(rate_limiter.window_hours)
+        
+        logger.info(f"Request processed for IP {client_ip}. Remaining requests: {remaining}")
+        return response
+
 server = Server("puch_ai")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "letmein")
 MOCK_USERS = {
-    "abc123token": "1234567890" # da we should add our actuall numbers here for validation
+    "RochitSudhan#1802": "+91 8197082621" # da we should add our actuall numbers here for validation
 }
 
 # Gemini configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+GEMINI_API_KEY ="AIzaSyCo_9pVuEiuCK2r-7R1ztttv2W1pSFBaDE"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 if GEMINI_API_KEY:
     try:
@@ -172,8 +276,56 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
 
 app = FastAPI()
 
+# Add rate limiting middleware
+app.add_middleware(RateLimitMiddleware)
+
+# Startup event to log rate limiting configuration
+@app.on_event("startup")
+async def startup_event():
+    logger.info(f"Rate limiting enabled: {rate_limiter.max_requests} requests per {rate_limiter.window_hours} hours per IP")
+    logger.info("Rate limiting endpoints available:")
+    logger.info("  - GET /rate-limit-status - Check your current rate limit status")
+    logger.info("  - GET /admin/rate-limit-stats - View overall rate limiting statistics")
+    logger.info("  - POST /admin/cleanup-rate-limits - Manually trigger cleanup of old entries")
+
+# Rate limit status endpoint
+@app.get("/rate-limit-status")
+async def get_rate_limit_status(request: Request):
+    client_ip = request.client.host
+    remaining = rate_limiter.get_remaining_requests(client_ip)
+    limit = rate_limiter.max_requests
+    used = limit - remaining
+    
+    return {
+        "ip": client_ip,
+        "limit": limit,
+        "used": used,
+        "remaining": remaining,
+        "window_hours": rate_limiter.window_hours,
+        "reset_time": f"Resets every {rate_limiter.window_hours} hours"
+    }
+
+# Admin endpoint to view rate limiting statistics
+@app.get("/admin/rate-limit-stats")
+async def get_rate_limit_stats():
+    stats = rate_limiter.get_stats()
+    return {
+        "rate_limiting_statistics": stats,
+        "timestamp": datetime.now().isoformat()
+    }
+
+# Admin endpoint to manually trigger cleanup
+@app.post("/admin/cleanup-rate-limits")
+async def cleanup_rate_limits():
+    rate_limiter.cleanup_old_entries()
+    return {"message": "Rate limit cleanup completed", "timestamp": datetime.now().isoformat()}
+
 @app.post("/")
 @app.post("/mcp")
+@app.get("/")
+def read_root():
+    return {"message": "Hello from MCP server | built by Sudhan and Rochit"}
+
 async def mcp_http_endpoint(request: Request):
     logger.info(f"HTTP POST with headers: {dict(request.headers)}")
     body = await request.body()
@@ -190,7 +342,7 @@ async def mcp_http_endpoint(request: Request):
                 "result": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "puch_ai", "version": "0.0.1"}
+                    "serverInfo": {"name": "TravelAI", "version": "0.0.1"}
                 }
             })
         elif method == "notifications/initialized":
