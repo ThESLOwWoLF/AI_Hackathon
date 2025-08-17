@@ -91,7 +91,7 @@ def add_rate_limit_headers(response: Response, client_ip: str):
     response.headers["X-RateLimit-Reset"] = str(rate_limiter.window_hours)
     return response
 
-server = Server("puch_ai")
+server = Server("Travel_AI")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "letmein")
 MOCK_USERS = {
     "RochitSudhan#1802": "+91 8197082621"
@@ -110,7 +110,7 @@ if GEMINI_API_KEY:
 async def list_tools() -> list[Tool]:
     return [Tool(
         name="validate",
-        description="Validate bearer token and return user's phone number for Puch AI authentication",
+        description="Validate bearer token and return user's phone number for Travel AI authentication",
         inputSchema={
             "type": "object",
             "properties": {"bearer_token": {"type": "string", "description": "Bearer token for authentication"}},
@@ -248,18 +248,18 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
     
     return CallToolResult(content=[TextContent(type="text", text=f"Tool not found: {name}")], isError=True)
 
-app = FastAPI(title="Puch AI MCP Server", version="1.0.0")
+app = FastAPI(title="Travel AI MCP Server", version="1.0.0")
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    logger.info(f"Puch AI MCP Server started with rate limiting: {rate_limiter.max_requests} requests per {rate_limiter.window_hours} hours per IP")
+    logger.info(f"Travel AI MCP Server started with rate limiting: {rate_limiter.max_requests} requests per {rate_limiter.window_hours} hours per IP")
 
 # Root endpoint
 @app.get("/")
 @app.post("/")
 async def read_root(client_ip: str = Depends(check_rate_limit)):
-    response_data = {"message": "Puch AI MCP Server | Built by Sudhan and Rochit"}
+    response_data = {"message": "Travel AI MCP Server | Built by Sudhan and Rochit"}
     response = JSONResponse(content=response_data)
     add_rate_limit_headers(response, client_ip)
     return response
@@ -281,7 +281,7 @@ async def mcp_http_endpoint(request: Request, client_ip: str = Depends(check_rat
                 "result": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "PuchAI", "version": "1.0.0"}
+                    "serverInfo": {"name": "Travel_AI", "version": "1.0.0"}
                 }
             })
             add_rate_limit_headers(response, client_ip)
@@ -345,7 +345,7 @@ async def mcp_websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
         
         await server.run(websocket.receive_text, websocket.send_text, InitializationOptions(
-            server_name="puch_ai",
+            server_name="Travel_ai",
             server_version="1.0.0",
             capabilities=server.get_capabilities(notification_options=NotificationOptions())
         ))
