@@ -94,11 +94,11 @@ def add_rate_limit_headers(response: Response, client_ip: str):
 server = Server("Travel_AI")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "letmein")
 MOCK_USERS = {
-    "RochitSudhan#1802": "+91 8197082621"
+    "abc123token": "1234567890" # real phone number was used to validate for Puch.ai hackathon
 }
 
 # Gemini configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCo_9pVuEiuCK2r-7R1ztttv2W1pSFBaDE")
+GEMINI_API_KEY =" Add your gemini API key here"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 if GEMINI_API_KEY:
     try:
