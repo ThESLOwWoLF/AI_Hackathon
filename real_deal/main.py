@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import threading
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Rate limiting storage
@@ -34,14 +34,11 @@ class RateLimiter:
                 # Check if under limit
                 if len(self.requests[ip]) < self.max_requests:
                     self.requests[ip].append(now)
-                    logger.info(f"Rate limit check passed for IP {ip}. Requests: {len(self.requests[ip])}/{self.max_requests}")
                     return True
                 
-                logger.warning(f"Rate limit exceeded for IP {ip}. Requests: {len(self.requests[ip])}/{self.max_requests}")
                 return False
         except Exception as e:
-            logger.error(f"Error in rate limit check for IP {ip}: {e}")
-            # In case of error, allow the request to prevent blocking legitimate users
+            logger.error(f"Rate limit error for IP {ip}: {e}")
             return True
     
     def get_remaining_requests(self, ip: str) -> int:
@@ -56,47 +53,7 @@ class RateLimiter:
                 return max(0, self.max_requests - len(self.requests[ip]))
         except Exception as e:
             logger.error(f"Error getting remaining requests for IP {ip}: {e}")
-            return self.max_requests  # Return max requests in case of error
-    
-    def cleanup_old_entries(self):
-        """Clean up old IP entries that haven't been used recently"""
-        try:
-            now = datetime.now()
-            cutoff = now - timedelta(hours=self.window_hours)
-            
-            with self.lock:
-                old_ips = [ip for ip, req_times in self.requests.items() 
-                          if not any(req_time > cutoff for req_time in req_times)]
-                
-                for ip in old_ips:
-                    del self.requests[ip]
-                
-                if old_ips:
-                    logger.info(f"Cleaned up {len(old_ips)} old IP entries")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-    
-    def get_stats(self):
-        """Get current rate limiting statistics"""
-        try:
-            with self.lock:
-                total_ips = len(self.requests)
-                total_requests = sum(len(req_times) for req_times in self.requests.values())
-                return {
-                    "total_ips": total_ips,
-                    "total_requests": total_requests,
-                    "max_requests_per_ip": self.max_requests,
-                    "window_hours": self.window_hours
-                }
-        except Exception as e:
-            logger.error(f"Error getting stats: {e}")
-            return {
-                "total_ips": 0,
-                "total_requests": 0,
-                "max_requests_per_ip": self.max_requests,
-                "window_hours": self.window_hours,
-                "error": str(e)
-            }
+            return self.max_requests
 
 # Initialize rate limiter
 rate_limiter = RateLimiter(max_requests=50, window_hours=24)
@@ -109,12 +66,10 @@ async def check_rate_limit(request: Request):
     # Handle cases where client IP might be None (e.g., from proxy)
     if not client_ip:
         client_ip = "unknown"
-        logger.warning("Could not determine client IP, using 'unknown'")
     
     # Check rate limit
     if not rate_limiter.is_allowed(client_ip):
         remaining_time = rate_limiter.window_hours
-        logger.warning(f"Rate limit exceeded for IP {client_ip} - returning 429 error")
         raise HTTPException(
             status_code=429, 
             detail={
@@ -139,11 +94,11 @@ def add_rate_limit_headers(response: Response, client_ip: str):
 server = Server("puch_ai")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "letmein")
 MOCK_USERS = {
-    "RochitSudhan#1802": "+91 8197082621" # da we should add our actuall numbers here for validation
+    "RochitSudhan#1802": "+91 8197082621"
 }
 
 # Gemini configuration
-GEMINI_API_KEY ="AIzaSyCo_9pVuEiuCK2r-7R1ztttv2W1pSFBaDE"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCo_9pVuEiuCK2r-7R1ztttv2W1pSFBaDE")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 if GEMINI_API_KEY:
     try:
@@ -153,7 +108,6 @@ if GEMINI_API_KEY:
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    logger.info("Tools requested")
     return [Tool(
         name="validate",
         description="Validate bearer token and return user's phone number for Puch AI authentication",
@@ -180,7 +134,6 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
-    logger.info(f"Tool called: {name} with arguments: {arguments}")
     if name == "validate":
         bearer_token = arguments.get("bearer_token", "")
         if bearer_token in MOCK_USERS:
@@ -200,7 +153,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
                 content=[TextContent(
                     type="text",
                     text=(
-                        "Gemini API key not configured. Set 'GEMINI_API_KEY' (or 'GOOGLE_API_KEY') in the environment "
+                        "Gemini API key not configured. Set 'GEMINI_API_KEY' in the environment "
                         "to enable the AI Trip Planner."
                     ),
                 )],
@@ -295,113 +248,25 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> CallToolResult:
     
     return CallToolResult(content=[TextContent(type="text", text=f"Tool not found: {name}")], isError=True)
 
-app = FastAPI()
+app = FastAPI(title="Puch AI MCP Server", version="1.0.0")
 
-# Rate limiting is now handled via dependencies on individual endpoints
-
-# Startup event to log rate limiting configuration
+# Startup event
 @app.on_event("startup")
 async def startup_event():
-    logger.info(f"Rate limiting enabled: {rate_limiter.max_requests} requests per {rate_limiter.window_hours} hours per IP")
-    logger.info("Rate limiting endpoints available:")
-    logger.info("  - GET /rate-limit-status - Check your current rate limit status")
-    logger.info("  - GET /admin/rate-limit-stats - View overall rate limiting statistics")
-    logger.info("  - POST /admin/cleanup-rate-limits - Manually trigger cleanup of old entries")
-    
-    # Schedule periodic cleanup (every hour)
-    import asyncio
-    async def periodic_cleanup():
-        while True:
-            await asyncio.sleep(3600)  # 1 hour
-            rate_limiter.cleanup_old_entries()
-            logger.info("Periodic rate limit cleanup completed")
-    
-    # Start cleanup task
-    asyncio.create_task(periodic_cleanup())
+    logger.info(f"Puch AI MCP Server started with rate limiting: {rate_limiter.max_requests} requests per {rate_limiter.window_hours} hours per IP")
 
-# Rate limit status endpoint
-@app.get("/rate-limit-status")
-async def get_rate_limit_status(client_ip: str = Depends(check_rate_limit)):
-    remaining = rate_limiter.get_remaining_requests(client_ip)
-    limit = rate_limiter.max_requests
-    used = limit - remaining
-    
-    response_data = {
-        "ip": client_ip,
-        "limit": limit,
-        "used": used,
-        "remaining": remaining,
-        "window_hours": rate_limiter.window_hours,
-        "reset_time": f"Resets every {rate_limiter.window_hours} hours"
-    }
-    
-    # Create response and add headers
-    response = JSONResponse(content=response_data)
-    add_rate_limit_headers(response, client_ip)
-    logger.info(f"Rate limit status checked for IP {client_ip}. Remaining requests: {remaining}")
-    
-    return response
-
-# Admin endpoint to view rate limiting statistics
-@app.get("/admin/rate-limit-stats")
-async def get_rate_limit_stats(client_ip: str = Depends(check_rate_limit)):
-    stats = rate_limiter.get_stats()
-    response_data = {
-        "rate_limiting_statistics": stats,
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    # Create response and add headers
-    response = JSONResponse(content=response_data)
-    add_rate_limit_headers(response, client_ip)
-    logger.info(f"Admin stats accessed by IP {client_ip}")
-    
-    return response
-
-# Admin endpoint to manually trigger cleanup
-@app.post("/admin/cleanup-rate-limits")
-async def cleanup_rate_limits(client_ip: str = Depends(check_rate_limit)):
-    rate_limiter.cleanup_old_entries()
-    response_data = {"message": "Rate limit cleanup completed", "timestamp": datetime.now().isoformat()}
-    
-    # Create response and add headers
-    response = JSONResponse(content=response_data)
-    add_rate_limit_headers(response, client_ip)
-    logger.info(f"Admin cleanup triggered by IP {client_ip}")
-    
-    return response
-
-# Test endpoint to verify rate limiting
-@app.get("/test-rate-limit")
-async def test_rate_limit(client_ip: str = Depends(check_rate_limit)):
-    response_data = {
-        "message": "Rate limiting is working!",
-        "timestamp": datetime.now().isoformat(),
-        "your_ip": client_ip
-    }
-    
-    # Create response and add headers
-    response = JSONResponse(content=response_data)
-    add_rate_limit_headers(response, client_ip)
-    logger.info(f"Test endpoint accessed by IP {client_ip}")
-    
-    return response
-
-@app.post("/")
-@app.post("/mcp")
+# Root endpoint
 @app.get("/")
+@app.post("/")
 async def read_root(client_ip: str = Depends(check_rate_limit)):
-    response_data = {"message": "Hello from MCP server | built by Sudhan and Rochit"}
-    
-    # Create response and add headers
+    response_data = {"message": "Puch AI MCP Server | Built by Sudhan and Rochit"}
     response = JSONResponse(content=response_data)
     add_rate_limit_headers(response, client_ip)
-    logger.info(f"Root endpoint accessed by IP {client_ip}")
-    
     return response
 
+# MCP HTTP endpoint
+@app.post("/mcp")
 async def mcp_http_endpoint(request: Request, client_ip: str = Depends(check_rate_limit)):
-    logger.info(f"HTTP POST with headers: {dict(request.headers)} from IP: {client_ip}")
     body = await request.body()
     try:
         data = json.loads(body.decode())
@@ -416,7 +281,7 @@ async def mcp_http_endpoint(request: Request, client_ip: str = Depends(check_rat
                 "result": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "TravelAI", "version": "0.0.1"}
+                    "serverInfo": {"name": "PuchAI", "version": "1.0.0"}
                 }
             })
             add_rate_limit_headers(response, client_ip)
@@ -442,6 +307,7 @@ async def mcp_http_endpoint(request: Request, client_ip: str = Depends(check_rat
             auth_header = request.headers.get("authorization", "")
             if auth_header.startswith("Bearer "):
                 arguments["bearer_token"] = auth_header[7:]
+            
             result = await call_tool(name, arguments)
             response = JSONResponse({
                 "jsonrpc": "2.0",
@@ -453,6 +319,7 @@ async def mcp_http_endpoint(request: Request, client_ip: str = Depends(check_rat
             })
             add_rate_limit_headers(response, client_ip)
             return response
+        
         response = JSONResponse({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}, status_code=400)
         add_rate_limit_headers(response, client_ip)
         return response
@@ -461,6 +328,7 @@ async def mcp_http_endpoint(request: Request, client_ip: str = Depends(check_rat
         add_rate_limit_headers(response, client_ip)
         return response
 
+# WebSocket endpoint
 @app.websocket("/mcp")
 async def mcp_websocket_endpoint(websocket: WebSocket):
     try:
@@ -471,16 +339,14 @@ async def mcp_websocket_endpoint(websocket: WebSocket):
         
         # Check rate limit before accepting connection
         if not rate_limiter.is_allowed(client_ip):
-            logger.warning(f"WebSocket connection rejected for IP {client_ip} - rate limit exceeded")
             await websocket.close(code=1008, reason="Rate limit exceeded")
             return
         
         await websocket.accept()
-        logger.info(f"WebSocket connection accepted for IP {client_ip}")
         
         await server.run(websocket.receive_text, websocket.send_text, InitializationOptions(
             server_name="puch_ai",
-            server_version="0.0.1",
+            server_version="1.0.0",
             capabilities=server.get_capabilities(notification_options=NotificationOptions())
         ))
     except Exception as e:
@@ -489,4 +355,4 @@ async def mcp_websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="debug")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
